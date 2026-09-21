@@ -1,7 +1,4 @@
-.PHONY: install start-worker test lint format
-
-install:
-	uv sync
+.PHONY: start-worker test lint format
 
 start-worker:
 	PYTHONPATH=src python -m entrypoints.worker

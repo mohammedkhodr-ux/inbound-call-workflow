@@ -1,106 +1,80 @@
-"""Tests for the inbound call workflow's pure helpers."""
+"""Tests for the inbound call workflow's pure helpers and orchestration contract."""
 
 from __future__ import annotations
 
-from integrations.servicenow import ServiceNowTicket, TicketContext
-from integrations.uaepass import UaePassProfile
-from workflows.inbound_call import InboundCallWorkflow
+import mistralai.workflows as workflows
+
+from workflows.activities.servicenow import analyze_tickets_and_sentiment
+from workflows.inbound_call import InboundCallWorkflow, _resolve_ticket
+from workflows.models import CallSummary, Ticket, TicketContext
 
 
-def _profile(name: str = "Ahmed Al Mansouri") -> UaePassProfile:
-    return UaePassProfile(uuid="uuid-1", fullnameEN=name, mobile="+971500000000", email="a@example.ae")
-
-
-def _context(sentiment: str = "neutral") -> TicketContext:
-    return TicketContext(
-        open_tickets=[
-            ServiceNowTicket(
-                sys_id="s1", number="INC001", short_description="Passport renewal", state="1", priority="4"
-            )
-        ],
-        recent_closed_tickets=[],
-        overall_sentiment=sentiment,
-        summary="The caller has INC001 (New, Low).",
+def _ticket(number: str = "INC001", sentiment: str | None = None) -> Ticket:
+    return Ticket(
+        sys_id="sysid-1",
+        number=number,
+        short_description="Permit application",
+        state="New",
+        opened_at="2026-09-01",
+        priority="Low",
+        sentiment=sentiment,
     )
 
 
-class TestGreeting:
-    def test_includes_first_name_and_tickets(self):
-        wf = InboundCallWorkflow()
-        greeting = wf._greeting(_profile(), _context())
-        assert greeting.startswith("Thank you Ahmed")
-        assert "INC001" in greeting
-        assert "How can I help you today?" in greeting
-
-    def test_apologises_for_negative_sentiment(self):
-        wf = InboundCallWorkflow()
-        greeting = wf._greeting(_profile(), _context(sentiment="negative"))
-        assert "sorry" in greeting
-
-    def test_no_tickets(self):
-        wf = InboundCallWorkflow()
-        greeting = wf._greeting(_profile(), TicketContext())
-        assert "open tickets" not in greeting
-
-    def test_falls_back_when_no_name(self):
-        wf = InboundCallWorkflow()
-        greeting = wf._greeting(_profile(name=""), TicketContext())
-        assert greeting.startswith("Thank you there")
+def _summary(ticket_number: str = "", outcome: str = "resolved") -> CallSummary:
+    return CallSummary(
+        topic="Permit application status",
+        resolution="Confirmed approval to the citizen.",
+        outcome=outcome,
+        ticket_number=ticket_number,
+    )
 
 
-class TestCloseOut:
-    async def test_sends_email_and_sms(self, mock_llm, mock_servicenow, monkeypatch):
-        from workflows import inbound_call as wf_module
+class TestResolveTicket:
+    def test_uses_summary_ticket_number(self):
+        context = TicketContext(tickets=[_ticket("INC001")])
+        ticket = _resolve_ticket(_summary(ticket_number="INC001"), context)
+        assert ticket == {"sys_id": "sysid-1", "number": "INC001"}
 
-        emails: list[tuple[str, str, str]] = []
-        smss: list[tuple[str, str]] = []
+    def test_falls_back_to_single_open_ticket(self):
+        context = TicketContext(tickets=[_ticket("INC001")])
+        ticket = _resolve_ticket(_summary(), context)
+        assert ticket == {"sys_id": "sysid-1", "number": "INC001"}
 
-        async def fake_email(to_email, subject, body):
-            emails.append((to_email, subject, body))
+    def test_no_ticket_when_summary_empty_and_multiple_open(self):
+        context = TicketContext(tickets=[_ticket("INC001"), _ticket("INC002")])
+        assert _resolve_ticket(_summary(), context) == {"sys_id": "", "number": ""}
 
-        async def fake_sms(to_number, body):
-            smss.append((to_number, body))
+    def test_summary_number_without_sys_id(self):
+        context = TicketContext(tickets=[])
+        assert _resolve_ticket(_summary(ticket_number="INC009"), context) == {
+            "sys_id": "",
+            "number": "INC009",
+        }
 
-        async def fake_log(event):
-            pass
 
-        monkeypatch.setattr(wf_module, "send_summary_email", fake_email)
-        monkeypatch.setattr(wf_module, "send_summary_sms", fake_sms)
-        monkeypatch.setattr(wf_module, "log_call_event", fake_log)
+class TestTicketContext:
+    async def test_negative_sentiment(self):
+        tickets = [_ticket(sentiment="negative"), _ticket(sentiment="frustrated")]
+        context = await analyze_tickets_and_sentiment("Ahmed", tickets)
+        assert context.overall_sentiment == "negative"
+        assert "INC001" in context.summary
 
-        from workflows.ai_activities import CallSummary
-
-        summary = CallSummary(
-            summary="Your request was handled.",
-            actions_taken=["Created ticket INC0100"],
-            outcome="resolved",
-            survey_url="https://surveys.dda.gov.ae/f/abc",
-        )
-        wf = InboundCallWorkflow()
-        await wf._close_out(_profile(), summary, conversation_id="conv-1")
-
-        assert len(emails) == 1
-        to, subject, body = emails[0]
-        assert to == "a@example.ae"
-        assert "Digital Dubai" in subject
-        assert "surveys.dda.gov.ae" in body
-        assert "INC0100" in body
-        assert len(smss) == 1
-        assert "surveys.dda.gov.ae" in smss[0][1]
+    async def test_no_tickets(self):
+        context = await analyze_tickets_and_sentiment("Ahmed", [])
+        assert context.overall_sentiment == "neutral"
+        assert "no open tickets" in context.summary
 
 
 class TestWorkflowRegistration:
     def test_workflow_definition(self):
-        import mistralai.workflows as workflows
-
         spec = workflows.get_workflow_definition(InboundCallWorkflow)
         assert spec.name == "dda-inbound-call"
         assert spec.display_name == "DDA Inbound Call"
 
-    def test_input_output_models(self):
-        from workflows.inbound_call import InboundCallInput, InboundCallOutput
+    def test_input_model(self):
+        from workflows.models import CallInput
 
-        data = InboundCallInput(conversation_id="conv-1")
-        assert data.phone_number == ""
-        out = InboundCallOutput(status="completed")
-        assert out.ticket_numbers == []
+        data = CallInput(call_id="c1", ani="+971501234567")
+        assert data.language == "en"
+        assert data.genesys_conversation_id is None

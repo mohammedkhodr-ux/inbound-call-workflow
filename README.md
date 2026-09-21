@@ -1,105 +1,136 @@
-# DDA Inbound Call Workflow
+# Digital Dubai Authority — AI Inbound Call Workflow
 
-A [Mistral Workflows](https://docs.mistral.ai/studio/workflows) project implementing the
-Digital Dubai Authority (DDA) inbound contact-centre flow:
+An inbound call center workflow for Digital Dubai Authority, where a citizen's call enters through **Genesys**, is handed to a **Mistral AI Voice Agent (AI Studio)**, authenticated via **UAEPASS**, resolved against **ServiceNow**, and closed with an **email + SMS summary and a feedback survey**.
 
-> A Dubai citizen calls the DDA call centre → **Genesys Cloud** routes the call to the
-> **Mistral voice AI** → the caller is authenticated with **UAE PASS** → existing
-> **ServiceNow** tickets and sentiment are loaded as context → the AI asks what the
-> caller needs and attempts to resolve the request → the relevant ticket is closed or
-> updated → the caller receives an **email and SMS summary** with a **feedback survey** link.
-
-## Architecture
+## Call flow
 
 ```
-Citizen ──phone──▶ Genesys Cloud ──▶ Mistral AI Studio Voice AI (this workflow)
-                                        │
-                                        ├── 1. Fetch call info (ANI, queue)
-                                        ├── 2. UAEPASS verification  ──signal──▶ uaepass_callback
-                                        ├── 3. ServiceNow: tickets + sentiment context
-                                        ├── 4. Ask "How can I help you today?"
-                                        ├── 5. Intent triage (mistral-small, structured output)
-                                        ├── 6. Resolution agent (mistral-medium + ServiceNow tools)
-                                        ├── 7. Close / update ServiceNow ticket
-                                        └── 8. Email + SMS summary with survey link
+Citizen call
+    │
+    ▼
+Genesys Cloud (IVR / routing)
+    │  Architect flow invokes the Mistral workflow via webhook
+    ▼
+Mistral Workflow: dda-inbound-call
+    │
+    1. authenticate_uaepass ──────────► UAEPASS (identity verification)
+    │
+    2. fetch_open_tickets ────────────► ServiceNow (open cases)
+    3. analyze_tickets_and_sentiment ─► Mistral LLM (context + sentiment)
+    │
+    4. conversation loop (voice AI): greet, ask "how can we help",
+    │   resolve the request using ServiceNow tools
+    │
+    5. generate_call_summary ────────► Mistral LLM (structured summary)
+    6. close_ticket ─────────────────► ServiceNow (close + attach summary)
+    7. send_email_summary ───────────► Email service (registered contact)
+    8. send_sms_summary ─────────────► SMS gateway (registered contact)
+    9. send_survey_link ─────────────► Email + SMS feedback survey
+    ▼
+Return result to Genesys (call disposition, survey sent, ticket closed)
 ```
 
-| Step | Component | Files |
-|---|---|---|
-| Voice routing context | `integrations/genesys.py` | conversation ID → ANI, queue, event logging |
-| Identity | `integrations/uaepass.py` | verification initiation, code → profile exchange |
-| Ticket context & actions | `integrations/servicenow.py` | fetch tickets, sentiment, create/update/close |
-| Notifications | `integrations/notify.py` | email + SMS with survey link |
-| AI steps | `workflows/ai_activities.py` | intent triage, call summary (structured output) |
-| Orchestration | `workflows/inbound_call.py` | the `dda-inbound-call` workflow |
+## Repository layout
 
-## Quick start
+```
+.
+├── README.md
+├── pyproject.toml
+├── .env.example                 # Environment variables for the worker
+├── Makefile
+├── docs/
+│   ├── architecture.md          # Sequence + activity breakdown
+│   └── workflow-diagram.md      # Mermaid flowchart and swimlanes
+├── genesys/
+│   └── architect-flow.md        # Genesys Cloud integration contract
+└── src/
+    ├── entrypoints/worker.py
+    └── workflows/
+        ├── __init__.py
+        ├── inbound_call.py      # Workflow orchestration + input/output models
+        ├── models.py            # Shared Pydantic models
+        ├── activities/
+        │   ├── uaepass.py       # UAEPASS identity verification
+        │   ├── servicenow.py    # ServiceNow ticket operations
+        │   ├── agent.py         # Voice AI conversation agent + summary
+        │   └── notifications.py  # Email / SMS / survey
+        └── agents/
+            ├── guardrails.py    # Instructions, guardrails, model config
+            └── prompts.py       # Voice prompts and survey copy
+```
+
+## Tests
 
 ```bash
-uv sync                     # or: pip install -e ".[dev]"
-cp .env.example .env        # fill in credentials
-make start-worker           # registers dda-inbound-call with Mistral Workflows
+make test   # pytest with stubbed UAEPASS/ServiceNow/LLM/email/SMS
+make lint   # ruff
 ```
 
-Trigger an execution from the Mistral Console (Workflows → DDA Inbound Call) with:
+## Setup
+
+```bash
+uvx mistralai-workflows-cli@latest setup   # one-time: register API key & scaffold env
+uv sync
+cp .env.example .env                        # fill in integration credentials
+```
+
+## Run
+
+```bash
+make start-worker
+```
+
+The worker registers the `dda-inbound-call` workflow with Mistral and waits for executions triggered by Genesys.
+
+## Trigger (test / Genesys)
+
+From the Mistral Console → Workflows → `dda-inbound-call` → Start Workflow, or via API:
 
 ```json
-{ "conversation_id": "<genesys-conversation-id>", "phone_number": "+971..." }
+{
+  "call_id": "genesys-call-123",
+  "ani": "+971501234567",
+  "genesys_conversation_id": "conv-abc-789",
+  "language": "en"
+}
 ```
 
-Or via the API:
+The workflow returns:
 
-```python
-from mistralai import Mistral
-
-client = Mistral(api_key="...")
-execution = client.workflows.execute_workflow(
-    workflow_identifier="dda-inbound-call",
-    input={"conversation_id": "abc-123", "phone_number": "+971501234567"},
-)
+```json
+{
+  "authenticated": true,
+  "citizen_name": "Ahmed Al Mansoori",
+  "open_tickets_found": 2,
+  "ticket_number": "INC0010012",
+  "resolution": "...",
+  "ticket_closed": true,
+  "email_sent": true,
+  "sms_sent": true,
+  "survey_sent": true
+}
 ```
 
-## Human-in-the-loop points
+## Environment variables
 
-- **UAEPASS approval** — after verification is initiated, the workflow suspends on
-  `wait_condition` until the UAEPASS callback webhook sends the `uaepass_callback`
-  signal with the authorisation code (3-minute timeout).
-- **Call dialogue** — the workflow converses through
-  `InteractiveWorkflow.wait_for_input`, so each caller turn resumes a suspended
-  execution; durable history survives worker restarts mid-call.
+| Variable | Purpose |
+| --- | --- |
+| `MISTRAL_API_KEY` | Mistral API key (set by the setup CLI) |
+| `UAEPASS_CLIENT_ID` / `UAEPASS_CLIENT_SECRET` | UAEPASS OIDC service credentials |
+| `UAEPASS_ISSUER_URL` | UAEPASS OIDC issuer |
+| `UAEPASS_TOKEN_URL` | UAEPASS token endpoint |
+| `UAEPASS_USERINFO_URL` | UAEPASS userinfo endpoint |
+| `SERVICENOW_INSTANCE` | ServiceNow instance FQDN |
+| `SERVICENOW_USER` / `SERVICENOW_PASSWORD` | ServiceNow service account |
+| `EMAIL_API_URL` / `EMAIL_API_KEY` | Outbound email API |
+| `SMS_API_URL` / `SMS_API_KEY` | Outbound SMS gateway API |
+| `SURVEY_URL_TEMPLATE` | Feedback survey link template (`{ticket}` placeholder) |
 
-## UAEPASS callback (signal)
+Secrets are read from the worker environment inside activities; they are never passed as workflow inputs or serialized into execution history.
 
-Wire the UAEPASS redirect endpoint to send the signal to the running execution:
-
-```python
-from mistralai import Mistral
-
-client = Mistral(api_key="...")
-client.workflows.executions.signal_workflow_execution(
-    execution_id="<execution-id>",
-    name="uaepass_callback",
-    input={"code": "<uaepass-authorization-code>"},
-)
-```
-
-## Development
+## Verification
 
 ```bash
-make test     # unit tests (all external systems stubbed)
-make lint     # ruff
+make verify      # lint + import checks
+make start-worker
 ```
-
-## Configuration
-
-All credentials and endpoints are environment variables — see [.env.example](.env.example).
-Never commit real secrets; the workflow reads them at worker start.
-
-## Notes
-
-- The resolution agent uses `LocalSession` with `mistral-medium-latest`; switch to
-  `RemoteSession(stream=True)` to stream responses to the voice UI.
-- ServiceNow sentiment is currently a keyword heuristic over ticket descriptions;
-  it can be upgraded to a Mistral classification call without changing the workflow.
-- Ticket close-out uses ServiceNow incident states (1 New / 2 In Progress / 3 On Hold /
-  7 Closed); adjust `close_ticket` if your instance uses custom states.
