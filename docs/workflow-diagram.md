@@ -6,130 +6,84 @@
 flowchart TD
     subgraph ENTRY["📞 Inbound Call"]
         A["Dubai citizen calls<br/>DDA contact centre"]
-        B["Genesys Cloud<br/>voice queue routing"]
-        C["Triggers dda-inbound-call workflow<br/>input: conversation_id, phone_number"]
+        B["Genesys Cloud routing<br/>(Architect inbound flow)"]
+        C["Call Data Action triggers<br/>dda-inbound-call workflow<br/>input: call_id, ani, language"]
     end
 
-    subgraph AUTH["🪪 Step 1–2 · Identity"]
-        D["Fetch call info (Genesys API)<br/>ANI + queue"]
-        E["Initiate UAE PASS verification<br/>push to citizen's app"]
-        F{{"⏸️ Suspended: wait_condition<br/>uaepass_callback signal<br/>timeout: 3 min"}}
-        G["Exchange code → verified profile<br/>UUID · name · mobile · email"]
+    subgraph AUTH["🪪 Step 1 · Identity"]
+        D["authenticate_uaepass<br/>OIDC backchannel lookup by ANI<br/>→ CitizenIdentity"]
     end
 
-    subgraph CONTEXT["🗂️ Step 3 · ServiceNow Context"]
-        H["Fetch caller's tickets"]
-        I["Build ticket context:<br/>open tickets + recently closed<br/>+ sentiment (pos/neutral/neg)"]
+    subgraph CONTEXT["🗂️ Step 2 · ServiceNow Context"]
+        E["fetch_open_tickets<br/>by u_epass_uuid"]
+        F["analyze_tickets_and_sentiment<br/>tickets + overall sentiment<br/>(pos/neutral/neg)"]
     end
 
-    subgraph DIALOGUE["💬 Step 4–5 · Dialogue & Triage"]
-        J["Greeting: verified ✓<br/>open tickets + apology<br/>if negative sentiment"]
-        K{{"⏸️ Suspended: wait_for_input<br/>'How can I help you today?'<br/>timeout: 2 min"}}
-        L["Intent triage — mistral-small<br/>structured CallerIntent:<br/>category · ticket ref · priority"]
+    subgraph DIALOGUE["💬 Step 3 · Voice AI Conversation"]
+        G["Durable agent (RemoteSession)<br/>mistral-large, EN/AR<br/>voice-channel guardrails"]
+        G -->|tool call| G1["get_ticket_details"]
+        G -->|tool call| G2["create_ticket"]
+        G -->|tool call| G3["update_ticket"]
+        G -->|tool call| G4["escalate_ticket"]
+        H{"Resolved<br/>on this call?"}
     end
 
-    subgraph RESOLUTION["🤖 Step 6 · Resolution Agent"]
-        M["mistral-medium agent<br/>with ServiceNow tools"]
-        M -->|tool call| M1["create_ticket"]
-        M -->|tool call| M2["update_ticket"]
-        M -->|tool call| M3["close_ticket"]
-        M -->|tool call| M4["fetch_caller_tickets"]
-        N{"Resolved<br/>on this call?"}
+    subgraph CLOSEOUT["📤 Step 4 · Close-out"]
+        I["generate_call_summary<br/>chat.parse → CallSummary<br/>topic · resolution · outcome"]
+        J["close_ticket<br/>state=7 + summary notes"]
+        K["📧 send_email_summary<br/>EN/AR + survey link"]
+        L["📱 send_sms_summary<br/>EN/AR + survey link"]
+        M["⭐ send_survey_invitation<br/>email + SMS"]
+        N["Return WorkflowResult<br/>to Genesys"]
     end
 
-    subgraph CLOSEOUT["📤 Step 7–8 · Close-out"]
-        O["Generate call summary — mistral-small<br/>summary · actions · outcome"]
-        P["Close ServiceNow ticket<br/>with resolution notes"]
-        Q["📧 Email summary<br/>+ survey link"]
-        R["📱 SMS summary<br/>+ survey link"]
-        S["Log workflow_completed<br/>event to Genesys"]
-    end
+    X1["escalate_ticket →<br/>DDA Human Support queue<br/>outcome=escalated"]
 
-    A --> B --> C --> D --> E --> F
-    F -->|callback code| G
-    F -->|timeout ❌| X1["Return: authentication_failed<br/>(graceful message)"]
-    G --> H --> I --> J --> K
-    K -->|caller speaks| L --> M
-    K -->|timeout ❌| X2["Graceful early exit"]
-    N -->|yes| P
-    N -->|no — escalate| X3["Create/update ticket,<br/>agent will follow up"]
-    M --> N
-    X3 --> O
-    P --> O --> Q --> R --> S
+    A --> B --> C --> D
+    D -->|lookup failed ❌| X2["Return: authenticated=false"]
+    D -->|verified ✓| E --> F --> G
+    G --> H
+    H -->|yes ✓| I --> J --> K --> L --> M --> N
+    H -->|no — cannot resolve| X1
+    X1 --> I
 ```
 
-## Swimlane view (who does what)
+## Swimlane view
 
 ```mermaid
 flowchart LR
     subgraph CITIZEN["Citizen"]
-        c1["Calls"]
-        c2["Approves UAE PASS"]
-        c3["States request"]
+        A1["Calls DDA"]
+        A2["Speaks with the AI<br/>(EN or AR)"]
+        A3["Receives email/SMS<br/>+ survey link"]
     end
-
     subgraph GENESYS["Genesys Cloud"]
-        g1["IVR / routing"]
-        g2["Conversation events"]
+        B1["Routes call,<br/>passes ANI + language"]
+    end
+    subgraph MISTRAL["Mistral voice AI + workflow"]
+        C1["UAEPASS backchannel auth"]
+        C2["Ticket context + sentiment"]
+        C3["Voice agent with<br/>ServiceNow tools"]
+        C4["Summary + close-out<br/>orchestration"]
+    end
+    subgraph SNOW["ServiceNow"]
+        D1["Open tickets"]
+        D2["Create/update/<br/>escalate/close"]
+    end
+    subgraph NOTIFY["Email / SMS"]
+        E1["Call summary"]
+        E2["Survey invitation"]
     end
 
-    subgraph MISTRAL["Mistral AI Studio"]
-        m1["dda-inbound-call<br/>(durable workflow)"]
-        m2["Intent triage"]
-        m3["Resolution agent"]
-        m4["Call summary"]
-    end
-
-    subgraph EXTERNAL["External Systems"]
-        u1["UAE PASS"]
-        s1["ServiceNow"]
-        n1["Email/SMS gateway"]
-    end
-
-    c1 --> g1 --> m1
-    m1 --> u1 --> c2
-    u1 -->|signal: uaepass_callback| m1
-    m1 --> s1
-    m1 --> m2 --> m3 -->|tools| s1
-    c3 --> m1
-    m1 --> m4 --> n1 --> c1
-    m1 --> g2
+    A1 --> B1 --> C1 --> C2 --> C3
+    C2 --> D1
+    C3 --> D2
+    C3 --> C4
+    C4 --> E1 --> A3
+    C4 --> E2
 ```
 
-## Execution timeline (what Studio shows)
+## Sequence
 
-```mermaid
-sequenceDiagram
-    participant C as Citizen
-    participant W as Workflow (durable)
-    participant U as UAE PASS
-    participant S as ServiceNow
-    participant N as Email/SMS
-
-    C->>W: 📞 call routed from Genesys
-    W->>W: fetch_call_info
-    W->>U: initiate verification
-    Note over W: ⏸️ suspended (no compute) —<br/>waiting for uaepass_callback signal
-    C->>U: approves in UAE PASS app
-    U-->>W: signal: uaepass_callback {code}
-    W->>U: exchange code → profile
-    W->>S: fetch tickets + sentiment
-    W->>C: greeting (tickets, sentiment-aware)
-    Note over W: ⏸️ suspended — wait_for_input<br/>"How can I help you today?"
-    C->>W: states request
-    W->>W: intent triage (mistral-small)
-    W->>S: resolution agent tool calls<br/>(create / update / close)
-    W->>S: close ticket + resolution notes
-    W->>W: call summary (mistral-small)
-    W->>N: email + SMS with survey link
-    W->>W: log Genesys event → ✅ completed
-```
-
-Key visual points:
-- The two ⏸️ **suspension points** (UAE PASS approval, caller dialogue) are where the
-  durable workflow parks at zero compute until an external event resumes it.
-- **Sentiment** from ServiceNow history shapes the greeting (apology on negative).
-- The **resolution agent** acts on ServiceNow directly through tools — no human
-  routing unless it decides to escalate.
-- **Every branch, retry, and state change** appears on the live execution timeline
-  in Mistral AI Studio.
+See [architecture.md](architecture.md) for the full sequence diagram and
+activity-by-activity description.

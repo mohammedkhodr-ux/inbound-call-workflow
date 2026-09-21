@@ -39,37 +39,63 @@ def servicenow_stub():
 
 
 @pytest.fixture
-def mock_servicenow(monkeypatch, servicenow_stub):
-    """Patch httpx calls inside servicenow.py to use the in-memory stub."""
-    from integrations import servicenow
+def mock_uaepass(monkeypatch):
+    """Patch the UAEPASS activity to return a verified profile for any phone number."""
+    from workflows.activities import uaepass
 
-    async def fake_fetch(caller_uuid: str):
-        from integrations.servicenow import ServiceNowQueryResult, ServiceNowTicket
+    async def fake_auth(phone_number: str):
+        from workflows.models import CitizenIdentity
 
-        tickets = [ServiceNowTicket.model_validate(t) for t in servicenow_stub.tickets.values()]
-        return ServiceNowQueryResult(caller_uuid=caller_uuid, tickets=tickets)
-
-    async def fake_create(caller_uuid: str, description: str, priority: str = "4"):
-        from integrations.servicenow import ServiceNowTicket
-
-        servicenow_stub.counter += 1
-        ticket = ServiceNowTicket(
-            sys_id=f"sysid-{servicenow_stub.counter}",
-            number=f"INC{1000 + servicenow_stub.counter}",
-            short_description=description[:160],
-            state="1",
-            priority=priority,
+        return CitizenIdentity(
+            uuid="uuid-1",
+            full_name_en="Ahmed Al Mansouri",
+            full_name_ar="أحمد المنصوري",
+            email="ahmed@example.ae",
+            mobile=phone_number,
+            emirates_id="784-XXXX-XXXX-X",
         )
-        servicenow_stub.created.append(ticket.number)
-        return ticket
+
+    monkeypatch.setattr(uaepass, "authenticate_uaepass", fake_auth)
+    return fake_auth
+
+
+@pytest.fixture
+def mock_servicenow(monkeypatch, servicenow_stub):
+    """Patch ServiceNow HTTP calls with the in-memory stub."""
+    from workflows.activities import servicenow
+
+    async def fake_fetch(citizen_uuid: str):
+        from workflows.models import Ticket
+
+        return [
+            Ticket.model_validate(
+                {
+                    "sys_id": t["sys_id"],
+                    "number": t["number"],
+                    "short_description": t["short_description"],
+                    "state": t["state"],
+                    "opened_at": t["opened_at"],
+                    "priority": t["priority"],
+                }
+            )
+            for t in servicenow_stub.tickets.values()
+        ]
+
+    async def fake_create(citizen_uuid: str, short_description: str, description: str, priority: str = "4"):
+        servicenow_stub.counter += 1
+        number = f"INC{1000 + servicenow_stub.counter}"
+        servicenow_stub.created.append(number)
+        return {"sys_id": f"sysid-{servicenow_stub.counter}", "number": number}
 
     async def fake_update(sys_id: str, work_note: str):
         servicenow_stub.work_notes.append((sys_id, work_note))
+        return True
 
-    async def fake_close(sys_id: str, resolution_note: str, resolution_code: str = "Resolved by AI"):
+    async def fake_close(sys_id: str, close_note: str):
         servicenow_stub.closed.append(sys_id)
+        return True
 
-    monkeypatch.setattr(servicenow, "fetch_caller_tickets", fake_fetch)
+    monkeypatch.setattr(servicenow, "fetch_open_tickets", fake_fetch)
     monkeypatch.setattr(servicenow, "create_ticket", fake_create)
     monkeypatch.setattr(servicenow, "update_ticket", fake_update)
     monkeypatch.setattr(servicenow, "close_ticket", fake_close)
@@ -77,25 +103,56 @@ def mock_servicenow(monkeypatch, servicenow_stub):
 
 
 @pytest.fixture
-def mock_llm(monkeypatch):
-    """Stub the Mistral chat-parse activity used by analyse_intent / summarise_call."""
-    import mistralai.workflows.plugins.mistralai as workflows_mistralai
+def mock_agent(monkeypatch):
+    """Patch the voice conversation activity to return a fixed transcript."""
+    from workflows.activities import agent
 
-    async def fake_parse(model_class, request):
-        if model_class.__name__ == "CallerIntent":
-            return model_class(
-                category="new_request",
-                related_ticket_number="",
-                priority="4",
-                request_summary="Citizen needs help with a service.",
-            )
-        if model_class.__name__ == "CallSummary":
-            return model_class(
-                summary="Thank you for calling Digital Dubai Authority. We addressed your request.",
-                actions_taken=["Ticket created"],
-                outcome="resolved",
-            )
-        raise AssertionError(f"Unexpected model {model_class}")
+    async def fake_conversation(identity, ticket_context, language):
+        return (
+            "AI: Thank you Ahmed, your identity is verified. I can see your ticket INC001. "
+            "How can I help you today?\n"
+            "Citizen: I need an update on my permit application.\n"
+            "AI: Your permit application was approved yesterday. Anything else?"
+        )
 
-    monkeypatch.setattr(workflows_mistralai, "chat_parse_to_model", fake_parse)
-    return fake_parse
+    monkeypatch.setattr(agent, "run_voice_conversation", fake_conversation)
+
+    async def fake_summary(identity, ticket_context, transcript, language):
+        from workflows.models import CallSummary
+
+        return CallSummary(
+            topic="Permit application status",
+            citizen_name=identity.full_name_en,
+            resolution="Confirmed the permit application was approved and informed the citizen.",
+            follow_up_actions=[],
+            outcome="resolved",
+            language=language,
+        )
+
+    monkeypatch.setattr(agent, "generate_call_summary", fake_summary)
+    return fake_summary
+
+
+@pytest.fixture
+def mock_notifications(monkeypatch):
+    """Patch email/SMS activities and capture what was sent."""
+    from workflows.activities import notifications
+
+    emails: list[tuple[str, str, str]] = []
+    smss: list[tuple[str, str]] = []
+
+    async def fake_email(identity, summary, survey_url):
+        emails.append((identity.email or "", summary.ticket_number, survey_url))
+        return True
+
+    async def fake_sms(identity, summary, survey_url):
+        smss.append((identity.mobile or "", survey_url))
+        return True
+
+    async def fake_survey(identity, summary, survey_url):
+        return True
+
+    monkeypatch.setattr(notifications, "send_email_summary", fake_email)
+    monkeypatch.setattr(notifications, "send_sms_summary", fake_sms)
+    monkeypatch.setattr(notifications, "send_survey_invitation", fake_survey)
+    return {"emails": emails, "smss": smss}

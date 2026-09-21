@@ -38,20 +38,32 @@ Return result to Genesys (call disposition, survey sent, ticket closed)
 ├── pyproject.toml
 ├── .env.example                 # Environment variables for the worker
 ├── Makefile
+├── docs/
+│   ├── architecture.md          # Sequence + activity breakdown
+│   └── workflow-diagram.md      # Mermaid flowchart and swimlanes
 ├── genesys/
 │   └── architect-flow.md        # Genesys Cloud integration contract
 └── src/
     ├── entrypoints/worker.py
     └── workflows/
+        ├── __init__.py
         ├── inbound_call.py      # Workflow orchestration + input/output models
+        ├── models.py            # Shared Pydantic models
         ├── activities/
         │   ├── uaepass.py       # UAEPASS identity verification
         │   ├── servicenow.py    # ServiceNow ticket operations
         │   ├── agent.py         # Voice AI conversation agent + summary
-        │   └── notifications.py # Email / SMS / survey
+        │   └── notifications.py  # Email / SMS / survey
         └── agents/
             ├── guardrails.py    # Instructions, guardrails, model config
             └── prompts.py       # Voice prompts and survey copy
+```
+
+## Tests
+
+```bash
+make test   # pytest with stubbed UAEPASS/ServiceNow/LLM/email/SMS
+make lint   # ruff
 ```
 
 ## Setup

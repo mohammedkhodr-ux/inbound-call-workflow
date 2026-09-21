@@ -6,7 +6,7 @@ import mistralai.workflows as workflows
 
 
 async def main() -> None:
-    discovered = workflows.discover_all_workflows_in_package("src.workflows")
+    discovered = workflows.discover_all_workflows_in_package("workflows")
     await workflows.run_worker(discovered)
 
 
