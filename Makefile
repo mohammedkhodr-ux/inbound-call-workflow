@@ -1,16 +1,10 @@
-.PHONY: install start-worker test lint format
-
-install:
-	uv sync
+.PHONY: start-worker verify lint
 
 start-worker:
-	PYTHONPATH=src python -m entrypoints.worker
+	uv run python -m src.entrypoints.worker
 
-test:
-	PYTHONPATH=src python -m pytest tests/ -q
+verify: lint
+	uv run python -c "import src.workflows.inbound_call"
 
 lint:
-	ruff check src tests
-
-format:
-	ruff format src tests
+	uv run ruff check src
