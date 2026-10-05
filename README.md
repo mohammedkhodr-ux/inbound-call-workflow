@@ -67,6 +67,11 @@ execution = client.workflows.execute_workflow(
 - **Call dialogue** — the workflow converses through
   `InteractiveWorkflow.wait_for_input`, so each caller turn resumes a suspended
   execution; durable history survives worker restarts mid-call.
+- **Feedback rating** — before the call ends the workflow asks the caller to rate
+  the call 1–5 (suggested answers offered); the rating is recorded as a Genesys
+  conversation tag (`call_feedback`), included in the summary email, and returned
+  as `feedback_rating`. If the caller stays silent the call still closes out
+  gracefully without the rating.
 
 ## UAEPASS callback (signal)
 

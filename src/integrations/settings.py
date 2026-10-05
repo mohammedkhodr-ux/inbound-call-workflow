@@ -18,6 +18,11 @@ class GenesysSettings(BaseModel):
     client_secret: str = Field(default="", alias="GENESYS_CLIENT_SECRET")
     queue_id: str = Field(default="", alias="GENESYS_VOICE_QUEUE_ID")
 
+    @property
+    def configured(self) -> bool:
+        """True when Genesys Cloud credentials are present (else demo fallbacks apply)."""
+        return bool(self.client_id and self.client_secret)
+
 
 class UaePassSettings(BaseModel):
     host: str = Field(default="https://id.uaepass.ae", alias="UAEPASS_HOST")
@@ -25,11 +30,21 @@ class UaePassSettings(BaseModel):
     client_secret: str = Field(default="", alias="UAEPASS_CLIENT_SECRET")
     redirect_uri: str = Field(default="", alias="UAEPASS_REDIRECT_URI")
 
+    @property
+    def configured(self) -> bool:
+        """True when UAE PASS credentials are present (else demo fallbacks apply)."""
+        return bool(self.client_id and self.client_secret)
+
 
 class ServiceNowSettings(BaseModel):
     instance: str = Field(default="", alias="SERVICENOW_INSTANCE")
     user: str = Field(default="", alias="SERVICENOW_USER")
     password: str = Field(default="", alias="SERVICENOW_PASSWORD")
+
+    @property
+    def configured(self) -> bool:
+        """True when ServiceNow credentials are present (else demo fallbacks apply)."""
+        return bool(self.instance and self.user and self.password)
 
 
 class EmailSettings(BaseModel):
@@ -37,11 +52,21 @@ class EmailSettings(BaseModel):
     smtp_port: int = Field(default=587, alias="SMTP_PORT")
     sender: str = Field(default="contactcentre@dda.gov.ae", alias="EMAIL_SENDER")
 
+    @property
+    def configured(self) -> bool:
+        """True when a non-default SMTP host is present (else demo fallbacks apply)."""
+        return bool(self.smtp_host and self.smtp_host != "localhost")
+
 
 class SmsSettings(BaseModel):
     provider_host: str = Field(default="", alias="SMS_PROVIDER_HOST")
     api_key: str = Field(default="", alias="SMS_API_KEY")
     sender_id: str = Field(default="DDA-GOV", alias="SMS_SENDER_ID")
+
+    @property
+    def configured(self) -> bool:
+        """True when an SMS gateway is present (else demo fallbacks apply)."""
+        return bool(self.provider_host and self.api_key)
 
 
 class Settings(BaseModel):

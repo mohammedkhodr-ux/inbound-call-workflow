@@ -7,11 +7,13 @@ End-to-end flow:
 3. It fetches the citizen's existing ServiceNow tickets and sentiment context.
 4. It asks what the citizen needs and attempts to resolve the request using a
    tool-calling resolution agent backed by ServiceNow.
-5. It closes/updates the relevant ServiceNow ticket, then emails and SMSes the
+5. It asks the citizen for a 1-5 rating of the call and records the feedback
+   as a Genesys conversation tag.
+6. It closes/updates the relevant ServiceNow ticket, then emails and SMSes the
    citizen a call summary with a feedback survey link.
 
 Human-in-the-loop: the UAEPASS callback arrives as a signal; the conversation
-turns arrive via InteractiveWorkflow.wait_for_input().
+turns and the feedback rating arrive via InteractiveWorkflow.wait_for_input().
 """
 
 from __future__ import annotations
@@ -22,8 +24,8 @@ import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
 from pydantic import BaseModel
 
-from integrations.genesys import GenesysEvent, fetch_call_info, log_call_event
-from integrations.notify import send_summary_email, send_summary_sms
+from integrations.genesys import GenesysEvent, fetch_call_info, log_call_event, record_call_feedback
+from integrations.notify import build_survey_url, send_summary_email, send_summary_sms
 from integrations.servicenow import (
     TicketContext,
     build_ticket_context,
@@ -32,7 +34,6 @@ from integrations.servicenow import (
     fetch_caller_tickets,
     update_ticket,
 )
-from integrations.settings import get_settings
 from integrations.uaepass import UaePassAuthResult, UaePassProfile, exchange_uaepass_code
 from workflows.ai_activities import CallerIntent, analyse_intent, summarise_call
 
@@ -49,6 +50,7 @@ class InboundCallOutput(BaseModel):
     ticket_numbers: list[str] = []
     summary: str = ""
     outcome: str = ""
+    feedback_rating: str = ""
     survey_url: str = ""
 
 
@@ -56,13 +58,17 @@ class UaePassCallback(BaseModel):
     code: str
 
 
+FEEDBACK_PROMPT = "How would you rate this call, 1 to 5?"
+FEEDBACK_SUGGESTIONS = ["5 - Excellent", "4 - Good", "3 - Okay", "2 - Poor", "1 - Very poor"]
+
+
 @workflows.workflow.define(
     name="dda-inbound-call",
     workflow_display_name="DDA Inbound Call",
     workflow_description=(
         "Digital Dubai Authority inbound call: Genesys voice routing, UAEPASS "
-        "authentication, ServiceNow ticket context and resolution, email/SMS "
-        "summary with feedback survey."
+        "authentication, ServiceNow ticket context and resolution, in-call "
+        "feedback rating, and email/SMS summary with feedback survey."
     ),
 )
 class InboundCallWorkflow(workflows.InteractiveWorkflow):
@@ -79,12 +85,18 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
         await workflows_mistralai.send_assistant_message(
             "Welcome to Digital Dubai Authority. Please wait while I verify your identity with UAE PASS."
         )
-
         call_info = await fetch_call_info(input.conversation_id)
         phone = input.phone_number or call_info.ani
 
         profile = await self._authenticate_with_uaepass(phone)
         if profile is None:
+            await log_call_event(
+                GenesysEvent(
+                    conversation_id=input.conversation_id,
+                    event_type="authentication_failed",
+                    detail=f"phone={phone}",
+                )
+            )
             return InboundCallOutput(
                 status="authentication_failed",
                 summary="UAEPASS verification did not complete. Please call again or visit a service centre.",
@@ -93,31 +105,41 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
         query_result = await fetch_caller_tickets(profile.uuid)
         ticket_context = await build_ticket_context(query_result)
 
-        greeting = self._greeting(profile, ticket_context)
-        await workflows_mistralai.send_assistant_message(greeting)
+        await workflows_mistralai.send_assistant_message(self._greeting(profile, ticket_context))
 
         request_text = await self._ask_what_they_need()
-        transcript = [f"Citizen: {request_text}"]
+        if request_text is None:
+            # Caller stayed silent past the dialogue timeout; wrap up gracefully.
+            summary = await summarise_call("The caller did not respond after the greeting.", profile.fullnameEN, [])
+            survey_url = await build_survey_url(workflows.get_execution_id() or "", profile.mobile)
+            summary.survey_url = survey_url
+            await self._close_out(profile, summary, input.conversation_id, feedback=None)
+            return InboundCallOutput(
+                status="no_response",
+                caller_name=profile.fullnameEN,
+                caller_uuid=profile.uuid,
+                summary=summary.summary,
+                outcome=summary.outcome,
+                survey_url=survey_url,
+            )
 
+        transcript = [f"Citizen: {request_text}"]
         intent = await analyse_intent(request_text, ticket_context.summary)
         transcript.append(f"AI triage: {intent.category} — {intent.request_summary}")
 
         ticket_numbers = [t.number for t in ticket_context.open_tickets]
         agent = self._build_resolution_agent(profile, ticket_context)
-
         resolution = await self._resolve_request(agent, request_text, intent, ticket_context, transcript)
         transcript.extend(resolution["new_transcript"])
-        conversation_id = input.conversation_id
 
         summary = await summarise_call(
             "\n".join(transcript), profile.fullnameEN, resolution["ticket_numbers"] or ticket_numbers
         )
-        survey_url = get_settings().survey_url_template.format(
-            execution_id=workflows.get_execution_id(), phone=profile.mobile
-        )
+        survey_url = await build_survey_url(workflows.get_execution_id() or "", profile.mobile)
         summary.survey_url = survey_url
 
-        await self._close_out(profile, summary, conversation_id)
+        feedback = await self._ask_for_feedback()
+        await self._close_out(profile, summary, input.conversation_id, feedback)
 
         return InboundCallOutput(
             status="completed",
@@ -126,6 +148,7 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
             ticket_numbers=resolution["ticket_numbers"] or ticket_numbers,
             summary=summary.summary,
             outcome=summary.outcome,
+            feedback_rating=feedback or "",
             survey_url=survey_url,
         )
 
@@ -144,7 +167,6 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
             )
         except TimeoutError:
             return None
-
         callback = self.uaepass_callback
         assert callback is not None
         auth_result: UaePassAuthResult = await exchange_uaepass_code(callback.code)
@@ -152,12 +174,37 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
             return None
         return auth_result.profile
 
-    async def _ask_what_they_need(self) -> str:
-        user_input = await self.wait_for_input(
-            workflows_mistralai.ChatInput("How can I help you today?"),
-            timeout=timedelta(minutes=2),
-        )
+    async def _ask_what_they_need(self) -> str | None:
+        """Wait for the caller's request; None when they stay silent past the timeout."""
+        try:
+            user_input = await self.wait_for_input(
+                workflows_mistralai.ChatInput("How can I help you today?"),
+                timeout=timedelta(minutes=2),
+            )
+        except TimeoutError:
+            return None
         return "".join(chunk.text for chunk in user_input.message) if user_input.message else ""
+
+    async def _ask_for_feedback(self) -> str | None:
+        """Ask the caller for a 1-5 rating; a timeout skips feedback gracefully.
+
+        Returns the chosen rating text (e.g. "5 - Excellent") or None when the
+        caller does not respond within the feedback window.
+        """
+        await workflows_mistralai.send_assistant_message(
+            "Thank you. Before you go, we would appreciate your feedback on this call."
+        )
+        try:
+            feedback = await self.wait_for_input(
+                workflows_mistralai.ChatInput(
+                    FEEDBACK_PROMPT,
+                    suggestions=[[workflows_mistralai.TextChunk(text=s)] for s in FEEDBACK_SUGGESTIONS],
+                ),
+                timeout=timedelta(seconds=30),
+            )
+        except TimeoutError:
+            return None
+        return "".join(chunk.text for chunk in feedback.message).strip() if feedback.message else None
 
     def _greeting(self, profile: UaePassProfile, ticket_context: TicketContext) -> str:
         name = profile.fullnameEN.split()[0] if profile.fullnameEN else "there"
@@ -176,7 +223,6 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
             "\n".join(f"- {t.number}: {t.short_description} (state={t.state})" for t in ticket_context.open_tickets)
             or "none"
         )
-
         return workflows_mistralai.Agent(
             model="mistral-medium-latest",
             name="dda-call-resolver",
@@ -204,7 +250,6 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
     ) -> dict:
         session = workflows_mistralai.LocalSession()
         new_transcript: list[str] = []
-
         result = await workflows_mistralai.Runner.run(
             agent=agent,
             inputs=request_text,
@@ -215,34 +260,34 @@ class InboundCallWorkflow(workflows.InteractiveWorkflow):
             text = getattr(output, "text", "")
             if text:
                 new_transcript.append(f"AI: {text}")
-
         affected_tickets: list[str] = []
         if intent.category == "existing_ticket" and intent.related_ticket_number:
             affected_tickets = [intent.related_ticket_number]
         elif intent.category == "new_request":
             affected_tickets = []
-
         return {"new_transcript": new_transcript, "ticket_numbers": affected_tickets}
 
-    async def _close_out(self, profile: UaePassProfile, summary, conversation_id: str) -> None:
+    async def _close_out(self, profile: UaePassProfile, summary, conversation_id: str, feedback: str | None) -> None:
         survey_url = summary.survey_url
         actions = "\n".join(f"- {a}" for a in summary.actions_taken) or "- none"
+        feedback_line = f"You rated this call {feedback}.\n\n" if feedback else ""
         email_body = (
             f"Dear {profile.fullnameEN or 'Sir/Madam'},\n\n"
             f"{summary.summary}\n\n"
             f"Actions taken:\n{actions}\n\n"
+            f"{feedback_line}"
             f"We would appreciate your feedback on this call: {survey_url}\n\n"
             "Digital Dubai Authority Contact Centre"
         )
         sms_body = (
             f"Digital Dubai Authority: thank you for your call. {summary.summary} Share your feedback: {survey_url}"
         )
-
+        if feedback:
+            await record_call_feedback(conversation_id, feedback)
         if profile.email:
             await send_summary_email(profile.email, "Your Digital Dubai call summary", email_body)
         if profile.mobile:
             await send_summary_sms(profile.mobile, sms_body)
-
         await log_call_event(
             GenesysEvent(
                 conversation_id=conversation_id,

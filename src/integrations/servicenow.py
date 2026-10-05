@@ -10,11 +10,13 @@ import base64
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import mistralai.workflows as workflows
+import structlog
 from pydantic import BaseModel, Field
 
 from integrations.settings import get_settings
+
+logger = structlog.get_logger(__name__)
 
 
 class ServiceNowTicket(BaseModel):
@@ -51,6 +53,22 @@ def _instance_url(instance: str) -> str:
 def _auth_header(user: str, password: str) -> str:
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
     return f"Basic {token}"
+
+
+_DEMO_TICKET_SEQ = {"n": 1000}
+
+
+def _demo_ticket(description: str, priority: str) -> ServiceNowTicket:
+    """Stable-looking demo ticket for unconfigured ServiceNow instances."""
+    _DEMO_TICKET_SEQ["n"] += 1
+    number = f"INC{_DEMO_TICKET_SEQ['n']}"
+    return ServiceNowTicket(
+        sys_id=f"demo-{number}",
+        number=number,
+        short_description=description[:160],
+        state="1",
+        priority=priority,
+    )
 
 
 def _parse_ticket(record: dict[str, Any]) -> ServiceNowTicket:
@@ -93,6 +111,16 @@ def _sentiment_from_records(tickets: list[ServiceNowTicket]) -> str:
 async def fetch_caller_tickets(caller_uuid: str) -> ServiceNowQueryResult:
     """Fetch the caller's open and recently closed tickets from ServiceNow."""
     settings = get_settings().servicenow
+    if not settings.configured:
+        logger.warning(
+            "ServiceNow is not configured; returning an empty ticket history",
+            caller_uuid=caller_uuid,
+        )
+        return ServiceNowQueryResult(caller_uuid=caller_uuid, tickets=[])
+
+    with workflows.unsafe.imports_passed_through():
+        import httpx
+
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
             f"{_instance_url(settings.instance)}/api/now/table/incident",
@@ -144,6 +172,17 @@ def _priority(priority: str) -> str:
 async def create_ticket(caller_uuid: str, description: str, priority: str = "4") -> ServiceNowTicket:
     """Create a new incident in ServiceNow for this caller."""
     settings = get_settings().servicenow
+    if not settings.configured:
+        ticket = _demo_ticket(description, priority)
+        logger.warning(
+            "ServiceNow is not configured; returning a demo ticket",
+            number=ticket.number,
+        )
+        return ticket
+
+    with workflows.unsafe.imports_passed_through():
+        import httpx
+
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             f"{_instance_url(settings.instance)}/api/now/table/incident",
@@ -166,6 +205,16 @@ async def create_ticket(caller_uuid: str, description: str, priority: str = "4")
 async def update_ticket(sys_id: str, work_note: str) -> None:
     """Append a work note to an existing ticket."""
     settings = get_settings().servicenow
+    if not settings.configured:
+        logger.warning(
+            "ServiceNow is not configured; skipping update_ticket (demo mode)",
+            sys_id=sys_id,
+        )
+        return
+
+    with workflows.unsafe.imports_passed_through():
+        import httpx
+
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.patch(
             f"{_instance_url(settings.instance)}/api/now/table/incident/{sys_id}",
@@ -179,6 +228,16 @@ async def update_ticket(sys_id: str, work_note: str) -> None:
 async def close_ticket(sys_id: str, resolution_note: str, resolution_code: str = "Resolved by AI") -> None:
     """Resolve and close a ticket with a resolution note."""
     settings = get_settings().servicenow
+    if not settings.configured:
+        logger.warning(
+            "ServiceNow is not configured; skipping close_ticket (demo mode)",
+            sys_id=sys_id,
+        )
+        return
+
+    with workflows.unsafe.imports_passed_through():
+        import httpx
+
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.patch(

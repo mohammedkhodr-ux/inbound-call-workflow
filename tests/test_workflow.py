@@ -64,9 +64,15 @@ class TestCloseOut:
         async def fake_log(event):
             pass
 
+        feedbacks: list[tuple[str, str]] = []
+
+        async def fake_feedback(conversation_id, rating, comment=""):
+            feedbacks.append((conversation_id, rating))
+
         monkeypatch.setattr(wf_module, "send_summary_email", fake_email)
         monkeypatch.setattr(wf_module, "send_summary_sms", fake_sms)
         monkeypatch.setattr(wf_module, "log_call_event", fake_log)
+        monkeypatch.setattr(wf_module, "record_call_feedback", fake_feedback)
 
         from workflows.ai_activities import CallSummary
 
@@ -77,7 +83,7 @@ class TestCloseOut:
             survey_url="https://surveys.dda.gov.ae/f/abc",
         )
         wf = InboundCallWorkflow()
-        await wf._close_out(_profile(), summary, conversation_id="conv-1")
+        await wf._close_out(_profile(), summary, conversation_id="conv-1", feedback="5 - Excellent")
 
         assert len(emails) == 1
         to, subject, body = emails[0]
@@ -87,6 +93,8 @@ class TestCloseOut:
         assert "INC0100" in body
         assert len(smss) == 1
         assert "surveys.dda.gov.ae" in smss[0][1]
+        assert feedbacks == [("conv-1", "5 - Excellent")]
+        assert "You rated this call 5 - Excellent" in emails[0][2]
 
 
 class TestWorkflowRegistration:
