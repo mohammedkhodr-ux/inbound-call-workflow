@@ -73,6 +73,10 @@ FEEDBACK_SUGGESTIONS = ["5 - Excellent", "4 - Good", "3 - Okay", "2 - Poor", "1 
 )
 class InboundCallWorkflow(workflows.InteractiveWorkflow):
     def __init__(self) -> None:
+        # InteractiveWorkflow.__init__ sets up the wait_for_input machinery
+        # (_pending_inputs etc.); without it the workflow crashes on the first
+        # caller turn.
+        super().__init__()
         self.uaepass_callback: UaePassCallback | None = None
 
     @workflows.workflow.signal(name="uaepass_callback")
